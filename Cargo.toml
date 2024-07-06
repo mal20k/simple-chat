@@ -1,0 +1,27 @@
+[package]
+name = "simple-chat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "chat-svr"
+
+[[bin]]
+name = "chat-clt"
+
+[dependencies]
+anyhow = { version = "1.0.86", default-features = false, features = ["std"] }
+clap = { version = "4.5.8", default-features = false, features = ["std", "derive"] }
+futures = { version = "0.3.30", default-features = false }
+futures-util = { version = "0.3.30", default-features = false, features = ["sink"] }
+tokio = { version = "1.38.0", default-features = false, features = ["full"] }
+tokio-stream = { version = "0.1.15", default-features = false, features = ["net"] }
+tokio-util = { version = "0.7.11", default-features = false, features = ["codec"] }
+ratatui = { version = "0.27.0", default-features = false, features = ["crossterm"] }
+regex = { version = "1.10.5", default-features = false, features = ["unicode-perl"] }
+serde = { version = "1.0.194", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.120", default-features = false, features = ["std"] }
+tui-input = { version = "0.9.0", default-features = false, features = ["crossterm"] }
+
+[workspace.lints.clippy]
+wildcard_imports = "deny"
