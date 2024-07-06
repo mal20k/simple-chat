@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod client;
 pub mod server;
 
 #[derive(Serialize, Deserialize)]

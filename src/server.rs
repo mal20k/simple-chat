@@ -1,16 +1,23 @@
 use std::collections::HashMap;
+use std::marker::Unpin;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures_util::sink::SinkExt;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::Mutex;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::StreamExt;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, ToSocketAddrs},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
+};
+use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::{ClientMessage, ServerMessage};
+
+type ChatFrame<T> = Framed<T, LinesCodec>;
 
 /// Implementation Note: Originally tried to use the tokio::sync::broadcast
 /// channel type, but the requirement is not to send the message to the sender.
@@ -54,49 +61,66 @@ pub async fn run<A: ToSocketAddrs>(addr: A) -> Result<()> {
     let nick_set = Arc::new(ClientSet::new());
 
     while let Some(socket) = listener.next().await {
-        let socket = socket?;
-        let mut socket = Framed::new(socket, LinesCodec::new());
-        if let Some(msg) = socket.next().await {
-            let (tx, rx) = mpsc::channel(16);
-            if let ClientMessage::Connect(nick) = serde_json::from_str(&msg?)? {
-                let mut clt = ClientHandle {
-                    nick,
-                    nick_set: nick_set.clone(),
-                    socket,
-                    receiver: rx,
-                };
-
-                match nick_set.register(&clt.nick, tx).await {
-                    Ok(()) => {
-                        clt.send(ServerMessage::Success).await?;
-                        let connect = format!("{} has joined the channel", clt.nick);
-                        clt.publish(&connect).await?;
-                        tokio::spawn(async move { clt.handle_client().await });
-                    }
-                    Err(err) => {
-                        clt.send(ServerMessage::Error(err.to_string())).await?;
-                        continue;
-                    }
-                }
-            }
-
-            return Err(anyhow::Error::msg(
-                "expected nick registration, received: {:?}",
-            ));
+        if let Ok(socket) = socket {
+            handle_incoming(socket, nick_set.clone()).await?;
         }
     }
 
     Ok(())
 }
 
-struct ClientHandle {
+async fn handle_incoming<S>(socket: S, nick_set: Arc<ClientSet>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut socket = Framed::new(socket, LinesCodec::new());
+    if let Some(msg) = socket.next().await {
+        if let ClientMessage::Connect(nick) = serde_json::from_str(&msg?)? {
+            let (mut clt, tx) = ClientHandle::new(&nick, nick_set, socket);
+            match clt.nick_set.register(&clt.nick, tx).await {
+                Ok(()) => {
+                    clt.send(ServerMessage::Success).await?;
+                    let connect = format!("{} has joined the channel", clt.nick);
+                    clt.publish(&connect).await?;
+                    tokio::spawn(async move { clt.handle_client().await });
+                }
+                Err(err) => {
+                    clt.send(ServerMessage::Error(err.to_string())).await?;
+                }
+            }
+        }
+
+        return Err(anyhow::Error::msg(
+            "expected nick registration, received: {:?}",
+        ));
+    }
+
+    Ok(())
+}
+
+struct ClientHandle<T> {
     nick: String,
     nick_set: Arc<ClientSet>,
-    socket: Framed<TcpStream, LinesCodec>,
+    socket: ChatFrame<T>,
     receiver: Receiver<String>,
 }
 
-impl ClientHandle {
+impl<T> ClientHandle<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(nick: &str, nick_set: Arc<ClientSet>, socket: ChatFrame<T>) -> (Self, Sender<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let clt = ClientHandle {
+            nick: nick.to_string(),
+            nick_set,
+            socket,
+            receiver: rx,
+        };
+
+        (clt, tx)
+    }
+
     async fn send(&mut self, msg: ServerMessage) -> Result<()> {
         let msg_json = serde_json::to_string(&msg)?;
         self.socket.send(msg_json).await?;
@@ -149,15 +173,7 @@ impl ClientHandle {
 
 #[cfg(test)]
 mod test {
-    //use futures::sink::SinkExt;
-    //use tokio::net::TcpStream;
-    //use tokio_stream::StreamExt;
-    //use tokio_util::codec::{Framed, LinesCodec};
-    //
-    //use simple_chat::ClientMessage;
-
     #[tokio::test]
-    #[should_panic]
     async fn register_twice() {
         use tokio::sync::mpsc;
         let (tx, _) = mpsc::channel(16);
@@ -166,116 +182,20 @@ mod test {
         nick_set.register(nick, tx.clone()).await.unwrap();
 
         let nick = "Nick1";
-        nick_set.register(nick, tx.clone()).await.unwrap();
+        nick_set.register(nick, tx.clone()).await.unwrap_err();
     }
 
-    //#[tokio::test]
-    //async fn client_connect() {
-    //    tokio::spawn(async move { crate::run("127.0.0.1:8080").await });
-    //    // Just waiting for the server to start, this should be swapped out
-    //    // since it slows down the tests
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //    let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //    let mut sock = Framed::new(sock, LinesCodec::new());
-    //    let register = ClientMessage::Connect("Nick1".to_string());
-    //    let register_json = serde_json::to_string(&register).unwrap();
-    //    sock.send(register_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //
-    //    let send_msg = ClientMessage::SendMsg("TestMsg".to_string());
-    //    let send_msg_json = serde_json::to_string(&send_msg).unwrap();
-    //    sock.send(send_msg_json).await.unwrap();
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //}
-    //
-    //#[tokio::test]
-    //async fn register_same_nick() {
-    //    tokio::spawn(async move { crate::run("127.0.0.1:8080").await });
-    //    // Just waiting for the server to start, this should be swapped out
-    //    // since it slows down the tests
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //    let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //    let mut sock = Framed::new(sock, LinesCodec::new());
-    //    let register = ClientMessage::Connect("Nick1".to_string());
-    //    let register_json = serde_json::to_string(&register).unwrap();
-    //    sock.send(register_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //
-    //    let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //    let mut sock = Framed::new(sock, LinesCodec::new());
-    //    let register = ClientMessage::Connect("Nick1".to_string());
-    //    let register_json = serde_json::to_string(&register).unwrap();
-    //    sock.send(register_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //}
-    //
-    //#[tokio::test]
-    //async fn register_same_nick_deregister() {
-    //    tokio::spawn(async move { crate::run("127.0.0.1:8080").await });
-    //    // Just waiting for the server to start, this should be swapped out
-    //    // since it slows down the tests
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //    let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //    let mut sock = Framed::new(sock, LinesCodec::new());
-    //    let register = ClientMessage::Connect("Nick1".to_string());
-    //    let register_json = serde_json::to_string(&register).unwrap();
-    //    sock.send(register_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //
-    //    let leave = ClientMessage::Leave;
-    //    let leave_json = serde_json::to_string(&leave).unwrap();
-    //    sock.send(leave_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //
-    //    let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //    let mut sock = Framed::new(sock, LinesCodec::new());
-    //    let register = ClientMessage::Connect("Nick1".to_string());
-    //    let register_json = serde_json::to_string(&register).unwrap();
-    //    sock.send(register_json).await.unwrap();
-    //    let reply = sock.next().await.unwrap().unwrap();
-    //    eprintln!("{reply:?}");
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //}
-    //
-    //#[tokio::test]
-    //async fn send_multiple() {
-    //    tokio::spawn(async move { crate::run("127.0.0.1:8080").await });
-    //    // Just waiting for the server to start, this should be swapped out
-    //    // since it slows down the tests
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //    tokio::spawn(async move {
-    //        let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //        let mut sock = Framed::new(sock, LinesCodec::new());
-    //        let register = ClientMessage::Connect("Nick1".to_string());
-    //        let register_json = serde_json::to_string(&register).unwrap();
-    //        sock.send(register_json).await.unwrap();
-    //        let reply = sock.next().await.unwrap().unwrap();
-    //        eprintln!("Nick1: {reply:?}");
-    //
-    //        let send_msg = ClientMessage::SendMsg("TestMsg".to_string());
-    //        let send_msg_json = serde_json::to_string(&send_msg).unwrap();
-    //        sock.send(send_msg_json).await.unwrap();
-    //    });
-    //
-    //    tokio::spawn(async move {
-    //        let sock = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-    //        let mut sock = Framed::new(sock, LinesCodec::new());
-    //        let register = ClientMessage::Connect("Nick2".to_string());
-    //        let register_json = serde_json::to_string(&register).unwrap();
-    //        sock.send(register_json).await.unwrap();
-    //        let reply = sock.next().await.unwrap().unwrap();
-    //        eprintln!("Nick2: {reply:?}");
-    //
-    //        let reply = sock.next().await.unwrap().unwrap();
-    //        eprintln!("Nick2: {reply:?}");
-    //    });
-    //
-    //    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //}
+    #[tokio::test]
+    async fn register_deregister() {
+        use tokio::sync::mpsc;
+        let (tx, _) = mpsc::channel(16);
+        let nick_set = std::sync::Arc::new(crate::server::ClientSet::new());
+        let nick = "Nick1";
+        nick_set.register(nick, tx.clone()).await.unwrap();
+
+        let nick = "Nick1";
+        nick_set.register(nick, tx.clone()).await.unwrap_err();
+        nick_set.deregister(nick).await;
+        nick_set.register(nick, tx.clone()).await.unwrap();
+    }
 }
