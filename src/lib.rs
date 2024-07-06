@@ -1,16 +1,21 @@
 use serde::{Deserialize, Serialize};
+use tokio_util::codec::{Framed, LinesCodec};
 
 pub mod client;
 pub mod server;
 
-#[derive(Serialize, Deserialize)]
+type ChatFrame<T> = Framed<T, LinesCodec>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    Message(String),
+    Message(String, String),
     Error(String),
-    Success,
+    Join(String),
+    Leave(String),
+    Connected,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Connect(String),
     SendMsg(String),

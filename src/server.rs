@@ -15,16 +15,14 @@ use tokio::{
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tokio_util::codec::{Framed, LinesCodec};
 
-use crate::{ClientMessage, ServerMessage};
-
-type ChatFrame<T> = Framed<T, LinesCodec>;
+use crate::{ChatFrame, ClientMessage, ServerMessage};
 
 /// Implementation Note: Originally tried to use the tokio::sync::broadcast
 /// channel type, but the requirement is not to send the message to the sender.
 /// Similarly, trying to store the actual network handle inside this set
 /// results in some bad borrowing failures.
 struct ClientSet {
-    inner: Mutex<HashMap<String, Sender<String>>>,
+    inner: Mutex<HashMap<String, Sender<ServerMessage>>>,
 }
 
 impl ClientSet {
@@ -35,10 +33,12 @@ impl ClientSet {
     }
 
     /// Registers the nick if it is not already in use
-    async fn register(&self, nick: &str, sender: Sender<String>) -> Result<()> {
+    async fn register(&self, nick: &str, sender: Sender<ServerMessage>) -> Result<()> {
         let mut inner = self.inner.lock().await;
         if inner.contains_key(nick) {
-            return Err(anyhow::Error::msg("nick already registered: {nick}"));
+            return Err(anyhow::Error::msg(format!(
+                "nick already registered: {nick}"
+            )));
         }
 
         inner.insert(nick.to_string(), sender);
@@ -75,24 +75,27 @@ where
 {
     let mut socket = Framed::new(socket, LinesCodec::new());
     if let Some(msg) = socket.next().await {
-        if let ClientMessage::Connect(nick) = serde_json::from_str(&msg?)? {
-            let (mut clt, tx) = ClientHandle::new(&nick, nick_set, socket);
-            match clt.nick_set.register(&clt.nick, tx).await {
-                Ok(()) => {
-                    clt.send(ServerMessage::Success).await?;
-                    let connect = format!("{} has joined the channel", clt.nick);
-                    clt.publish(&connect).await?;
-                    tokio::spawn(async move { clt.handle_client().await });
-                }
-                Err(err) => {
-                    clt.send(ServerMessage::Error(err.to_string())).await?;
+        match serde_json::from_str(&msg?)? {
+            ClientMessage::Connect(nick) => {
+                let (mut clt, tx) = ClientHandle::new(&nick, nick_set, socket);
+                match clt.nick_set.register(&clt.nick, tx).await {
+                    Ok(()) => {
+                        clt.send(ServerMessage::Connected).await?;
+                        clt.publish(ServerMessage::Join(clt.nick.clone())).await?;
+                        eprintln!("User has joined the channel: {}", clt.nick);
+                        tokio::spawn(async move { clt.handle_client().await });
+                    }
+                    Err(err) => {
+                        clt.send(ServerMessage::Error(err.to_string())).await?;
+                    }
                 }
             }
+            msg => {
+                return Err(anyhow::Error::msg(format!(
+                    "expected nick registration, received: {msg:?}"
+                )));
+            }
         }
-
-        return Err(anyhow::Error::msg(
-            "expected nick registration, received: {:?}",
-        ));
     }
 
     Ok(())
@@ -102,15 +105,19 @@ struct ClientHandle<T> {
     nick: String,
     nick_set: Arc<ClientSet>,
     socket: ChatFrame<T>,
-    receiver: Receiver<String>,
+    receiver: Receiver<ServerMessage>,
 }
 
 impl<T> ClientHandle<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(nick: &str, nick_set: Arc<ClientSet>, socket: ChatFrame<T>) -> (Self, Sender<String>) {
-        let (tx, rx) = mpsc::channel::<String>(16);
+    fn new(
+        nick: &str,
+        nick_set: Arc<ClientSet>,
+        socket: ChatFrame<T>,
+    ) -> (Self, Sender<ServerMessage>) {
+        let (tx, rx) = mpsc::channel::<ServerMessage>(16);
         let clt = ClientHandle {
             nick: nick.to_string(),
             nick_set,
@@ -128,14 +135,13 @@ where
     }
 
     /// Loops through the list of other clients to send them the message
-    async fn publish(&mut self, msg: &str) -> Result<()> {
+    async fn publish(&mut self, msg: ServerMessage) -> Result<()> {
         let mut inner = self.nick_set.inner.lock().await;
         for (nick, sender) in inner.iter_mut() {
             if *nick == self.nick {
                 continue;
             }
-
-            sender.send(msg.to_string()).await?;
+            sender.send(msg.clone()).await?;
         }
         Ok(())
     }
@@ -147,22 +153,23 @@ where
                     if let Some(incoming) = incoming {
                         match serde_json::from_str(&incoming?)? {
                             ClientMessage::SendMsg(incoming) => {
-                                self.publish(&incoming).await?;
+                                eprintln!("Message received - {}: {}", self.nick, incoming);
+                                let msg = ServerMessage::Message(self.nick.clone(), incoming);
+                                self.publish(msg).await?;
                             }
                             ClientMessage::Leave => {
+                                eprintln!("User has left the channel: {}", self.nick);
+                                self.publish(ServerMessage::Leave(self.nick.clone())).await?;
                                 self.nick_set.deregister(&self.nick).await;
-                                self.send(ServerMessage::Success).await?;
-                                let disconnect = format!("{} has disconnected", self.nick);
-                                self.publish(&disconnect).await?;
                                 break;
                             }
-                            _ => todo!(),
+                            _ => self.send(ServerMessage::Error("Unrecognized message".to_string())).await?,
                         }
                     }
                 },
                 msg = self.receiver.recv() => {
                     if let Some(msg) = msg {
-                        self.send(ServerMessage::Message(msg)).await?;
+                        self.send(msg).await?;
                     }
                 },
             );

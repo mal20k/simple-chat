@@ -1,7 +1,7 @@
 use std::io::{stdout, Stdout};
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
@@ -19,7 +19,10 @@ use ratatui::{
 use regex::Regex;
 use tui_input::{backend::crossterm::EventHandler, Input};
 
-use simple_chat::client::Connection;
+use simple_chat::{
+    client::{Connection, Messages},
+    ClientMessage,
+};
 
 static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
@@ -69,23 +72,9 @@ impl core::str::FromStr for ClientCommand<String> {
 }
 
 #[derive(Debug, Default)]
-struct Messages {
-    messages: Mutex<Vec<(String, String)>>,
-}
-
-impl Messages {
-    fn push(&mut self, nick: &str, msg: &str) {
-        self.messages
-            .lock()
-            .unwrap()
-            .push((nick.to_string(), msg.to_string()))
-    }
-}
-
-#[derive(Debug, Default)]
 pub struct App {
     input: Input,
-    messages: Messages,
+    messages: Arc<Messages>,
     connection: Option<Connection>,
     exit: bool,
 }
@@ -113,20 +102,24 @@ impl App {
                             if self.connection.is_none() {
                                 self.messages
                                     .push("INFO", &format!("Connecting to {addr} as {nick}"));
-                                if let Ok(connection) = Connection::connect(&nick, addr) {
-                                    self.connection = Some(connection);
-                                } else {
-                                    // TODO: Display the specific error
-                                    self.messages.push("ERROR", "Failed to connect to server");
+                                match Connection::connect(&nick, addr, self.messages.clone()) {
+                                    Ok(connection) => self.connection = Some(connection),
+                                    Err(e) => {
+                                        let err = format!("Failed to connect to server: {e}");
+                                        self.messages.push("ERROR", &err);
+                                    }
                                 }
                             } else {
                                 self.messages.push("ERROR", "Already connected to server");
                             }
                         }
                         Ok(ClientCommand::Send(message)) => {
-                            if let Some(connection) = &self.connection {
+                            if let Some(connection) = &mut self.connection {
                                 self.messages.push(&connection.nick, &message);
-                                connection.send(&message).unwrap();
+                                if let Err(e) = connection.send(ClientMessage::SendMsg(message)) {
+                                    let err = format!("Failed to send message: {e}");
+                                    self.messages.push("ERROR", &err);
+                                }
                             } else {
                                 self.messages.push("ERROR", "Not connected to a server");
                             }
@@ -148,6 +141,16 @@ impl App {
 
     fn exit(&mut self) {
         self.exit = true;
+        if let Some(connection) = &mut self.connection {
+            connection
+                .send(ClientMessage::Leave)
+                .or_else(|e| {
+                    eprintln!("Failed to send disconnect message: {e:?}");
+                    anyhow::Ok(())
+                })
+                .context("should always return Ok")
+                .unwrap();
+        }
     }
 }
 
@@ -188,9 +191,7 @@ fn ui(f: &mut Frame, app: &App) {
         .border_set(border::THICK);
     let messages: Vec<ListItem> = app
         .messages
-        .messages
-        .lock()
-        .unwrap()
+        .get()
         .iter()
         .map(|(n, m)| {
             let content = vec![Line::from(Span::raw(format!("{n}: {m}")))];
